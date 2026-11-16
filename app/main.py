@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -26,10 +27,11 @@ from html import escape
 from pathlib import Path
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from .grouping import Photo, assign_split, compute_groups
+from .review import CandidateGroup, Infeasible, TooManyCandidates, select_groups
 
 REQUIRED_COLUMNS = ("photo_no", "camera_no", "captured_at", "species", "rel_path")
 INDEX_COLUMNS = ("photo_no", "camera_no", "captured_at", "species", "rel_path", "group_id")
@@ -133,6 +135,31 @@ CREATE TABLE IF NOT EXISTS versions (
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_lists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    version_id INTEGER NOT NULL REFERENCES versions(id),  -- 清单固定到该版本
+    camera_no TEXT NOT NULL,
+    group_date TEXT NOT NULL,          -- 组起始 UTC 日期 YYYY-MM-DD
+    quotas TEXT NOT NULL,              -- JSON {物种: 至少复核组数}
+    max_groups INTEGER NOT NULL,
+    group_count INTEGER NOT NULL       -- 实际选出的组数
+);
+CREATE TABLE IF NOT EXISTS review_list_groups (
+    list_id INTEGER NOT NULL REFERENCES review_lists(id),
+    group_id TEXT NOT NULL,
+    PRIMARY KEY (list_id, group_id)
+);
+CREATE TABLE IF NOT EXISTS review_list_photos (
+    list_id INTEGER NOT NULL REFERENCES review_lists(id),
+    group_id TEXT NOT NULL,
+    photo_no TEXT NOT NULL,
+    camera_no TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    species TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    PRIMARY KEY (list_id, photo_no)
 );
 """
 
@@ -408,6 +435,119 @@ def process_batch(settings: Settings, filename: str, rows: list[CsvRow]) -> tupl
         conn.close()
 
 
+# ---------------------------------------------------------------- 复核清单
+
+def load_train_rows(settings: Settings, vid: int) -> tuple[sqlite3.Row | None, list[dict]]:
+    """读取指定版本训练索引（发布后不可变的文件）。版本不存在返回 (None, [])。"""
+    conn = connect(settings)
+    try:
+        v = conn.execute("SELECT * FROM versions WHERE id=?", (vid,)).fetchone()
+    finally:
+        conn.close()
+    if v is None:
+        return None, []
+    path = settings.data_dir / v["train_path"]
+    if not path.is_file():
+        raise HTTPException(500, f"索引文件缺失: {v['train_path']}")
+    with open(path, newline="", encoding="utf-8") as f:
+        return v, list(csv.DictReader(f))
+
+
+def build_candidates(
+    rows: list[dict], camera_no: str, group_date: str
+) -> tuple[list[CandidateGroup], dict[str, list[dict]]]:
+    """从训练索引行中筛出候选组（指定相机、组起始 UTC 日期），并保留候选组的原始行。
+
+    候选只来自所选版本的索引文件，不读 photos 表：补传发布与挑选交错时
+    也不会混用不同版本的索引。
+    """
+    by_group: dict[str, list[dict]] = {}
+    for r in rows:
+        if r["camera_no"] == camera_no:
+            by_group.setdefault(r["group_id"], []).append(r)
+    candidates: list[CandidateGroup] = []
+    kept: dict[str, list[dict]] = {}
+    for gid, grows in by_group.items():
+        started = min(r["captured_at"] for r in grows)
+        if started[:10] != group_date:
+            continue
+        candidates.append(
+            CandidateGroup(gid, started, frozenset(r["species"] for r in grows), len(grows))
+        )
+        kept[gid] = sorted(grows, key=lambda r: (r["captured_at"], r["photo_no"]))
+    candidates.sort(key=lambda g: g.group_id)
+    return candidates, kept
+
+
+def _insert_review_list(conn, vid, camera_no, group_date, quotas, max_groups, group_ids) -> int:
+    cur = conn.execute(
+        "INSERT INTO review_lists(created_at, version_id, camera_no, group_date, quotas, max_groups, group_count)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (
+            utcnow_str(),
+            vid,
+            camera_no,
+            group_date,
+            json.dumps(quotas, ensure_ascii=False, sort_keys=True),
+            max_groups,
+            len(group_ids),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def _insert_review_groups(conn, list_id, group_ids) -> None:
+    conn.executemany(
+        "INSERT INTO review_list_groups(list_id, group_id) VALUES (?,?)",
+        [(list_id, gid) for gid in group_ids],
+    )
+
+
+def _insert_review_photos(conn, list_id, group_ids, group_rows) -> None:
+    conn.executemany(
+        "INSERT INTO review_list_photos(list_id, group_id, photo_no, camera_no, captured_at, species, rel_path)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [
+            (list_id, gid, r["photo_no"], r["camera_no"], r["captured_at"], r["species"], r["rel_path"])
+            for gid in group_ids
+            for r in group_rows[gid]
+        ],
+    )
+
+
+def save_review_list(
+    settings: Settings,
+    vid: int,
+    camera_no: str,
+    group_date: str,
+    quotas: dict,
+    max_groups: int,
+    group_ids: list[str],
+    group_rows: dict[str, list[dict]],
+) -> int:
+    """清单头、所选组、全部照片快照在同一个事务写入。
+
+    任一步失败整体回滚：数据库里要么出现一份完整清单，要么什么都没有，
+    绝不留下半份清单；已保存的旧清单不受影响。
+    """
+    conn = connect(settings)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        list_id = _insert_review_list(conn, vid, camera_no, group_date, quotas, max_groups, group_ids)
+        _insert_review_groups(conn, list_id, group_ids)
+        _insert_review_photos(conn, list_id, group_ids, group_rows)
+        conn.execute("COMMIT")
+        return list_id
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- 页面渲染
 
 PAGE_CSS = """
@@ -458,6 +598,7 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
         active_id = get_active_version(conn)
         versions = conn.execute("SELECT * FROM versions ORDER BY id DESC").fetchall()
         batches = conn.execute("SELECT * FROM batches ORDER BY id DESC LIMIT 50").fetchall()
+        recent_lists = conn.execute("SELECT * FROM review_lists ORDER BY id DESC LIMIT 5").fetchall()
     finally:
         conn.close()
 
@@ -486,6 +627,23 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
 时间为 UTC（ISO8601，如 <code>2026-03-01T08:00:00Z</code>）。
 同一相机相邻 ≤{settings.gap_seconds} 秒的照片传递归组；按组稳定划分（验证集比例 {settings.val_percent}%）。
 同号同内容重投不产生新版本；同号异内容整批拒绝。</p></div>"""
+
+    # 人工复核挑选入口
+    if recent_lists:
+        items = "".join(
+            f'<li><a href="/review/{r["id"]}">清单 #{r["id"]}</a>：v{r["version_id"]} · '
+            f'{escape(r["camera_no"])} · {r["group_date"]} · {r["group_count"]} 组（{r["created_at"]}）</li>'
+            for r in recent_lists
+        )
+        recent_html = f"<p>最近清单：</p><ul>{items}</ul>"
+    else:
+        recent_html = ""
+    review_card = f"""
+<div class="card"><h2 style="margin-top:0">人工复核挑选</h2>
+<p>从指定已发布版本的<b>训练索引</b>中，按相机与组起始 UTC 日期挑选满足各物种配额的最少出没组，
+生成固定到该版本的复核清单（含所选组的全部照片与原图相对路径）。</p>
+<p><a class="btn" href="/review/new">新建挑选</a> <a class="btn secondary" href="/review">清单列表</a></p>
+{recent_html}</div>"""
 
     # 样例
     samples_html = ""
@@ -544,7 +702,7 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
     else:
         batches_html = ""
 
-    return page("首页", flash_html(msg, kind) + banner + upload + samples_html + versions_html + batches_html)
+    return page("首页", flash_html(msg, kind) + banner + upload + review_card + samples_html + versions_html + batches_html)
 
 
 def version_detail_page(settings: Settings, vid: int) -> str:
@@ -639,6 +797,177 @@ def batch_detail_page(settings: Settings, bid: int) -> str:
     return page(f"批次 #{bid}", body)
 
 
+# ---------------------------------------------------------------- 复核清单页面
+
+def review_new_page(settings: Settings, params) -> str:
+    """新建挑选表单：选已发布版本、相机、组起始 UTC 日期，填物种配额与总组数上限。"""
+    msg = params.get("msg", "")
+    kind = params.get("kind", "info")
+    conn = connect(settings)
+    try:
+        versions = conn.execute("SELECT * FROM versions ORDER BY id").fetchall()
+        active_id = get_active_version(conn)
+    finally:
+        conn.close()
+    if not versions:
+        body = (
+            '<div class="card"><p>尚未发布任何版本，请先在首页上传 CSV 发布版本后再挑选。</p>'
+            '<p><a class="btn secondary" href="/">返回首页</a></p></div>'
+        )
+        return page("新建复核挑选", flash_html(msg, kind) + body)
+
+    try:
+        vid = int(params.get("version_id", "") or 0)
+    except ValueError:
+        vid = 0
+    if not any(v["id"] == vid for v in versions):
+        vid = active_id if active_id is not None else versions[-1]["id"]
+
+    v, rows = load_train_rows(settings, vid)
+    cameras = sorted({r["camera_no"] for r in rows})
+    species_all = sorted({r["species"] for r in rows})
+
+    version_opts = "".join(
+        f'<option value="{v2["id"]}"{" selected" if v2["id"] == vid else ""}>'
+        f'v{v2["id"]}（{v2["created_at"]} · {v2["photo_count"]} 张 / {v2["group_count"]} 组'
+        f'{" · 现役" if v2["id"] == active_id else ""}）</option>'
+        for v2 in versions
+    )
+    cur_camera = params.get("camera_no", "")
+    camera_opts = '<option value="">— 请选择 —</option>' + "".join(
+        f'<option value="{escape(c)}"{" selected" if c == cur_camera else ""}>{escape(c)}</option>'
+        for c in cameras
+    )
+    quota_rows = "".join(
+        f'<tr><td>{escape(s)}</td>'
+        f'<td><input type="number" name="quota_{escape(s)}" min="0" style="width:90px" '
+        f'value="{escape(params.get(f"quota_{s}", "0"))}"></td></tr>'
+        for s in species_all
+    )
+    quotas_table = (
+        "<table><tr><th>物种（该版本训练索引中出现的）</th><th>至少复核组数（0 = 不要求）</th></tr>"
+        f"{quota_rows}</table>"
+        if species_all
+        else "<p>该版本训练索引为空，无可选物种。</p>"
+    )
+    body = f"""
+<div class="card"><h2 style="margin-top:0">新建人工复核挑选</h2>
+<form method="get" action="/review/new">
+<p>已发布版本：<select name="version_id">{version_opts}</select>
+<button class="btn secondary" type="submit">切换版本</button></p>
+</form>
+<form method="post" action="/review">
+<input type="hidden" name="version_id" value="{vid}">
+<p>相机：<select name="camera_no" required>{camera_opts}</select></p>
+<p>组起始 UTC 日期：<input type="date" name="group_date" required
+value="{escape(params.get('group_date', ''))}"></p>
+<p>总组数上限：<input type="number" name="max_groups" min="1" required style="width:90px"
+value="{escape(params.get('max_groups', '10'))}"></p>
+<h3>各物种至少复核多少组</h3>
+{quotas_table}
+<p><button class="btn" type="submit">生成复核清单</button>
+<a class="btn secondary" href="/review">清单列表</a></p>
+</form>
+<p class="muted">仅从版本 v{vid} 的<b>训练索引</b>选组（该版本共 {v['group_count']} 组）；
+同组含多种物种时可同时抵多个配额；满足配额的前提下组数最少，并列时按组号稳定选取。
+当日候选超过 18 组时需缩小范围；无解时会说明是可用组不足还是总上限不足，不生成部分清单。
+清单固定到 v{vid}，不随后续发布变化。</p></div>"""
+    return page("新建复核挑选", flash_html(msg, kind) + body)
+
+
+def review_list_page(settings: Settings) -> str:
+    conn = connect(settings)
+    try:
+        lists = conn.execute("SELECT * FROM review_lists ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+    if lists:
+        rows_html = "".join(
+            f'<tr><td><a href="/review/{r["id"]}">#{r["id"]}</a></td><td>{r["created_at"]}</td>'
+            f'<td><a href="/versions/{r["version_id"]}">v{r["version_id"]}</a></td>'
+            f"<td>{escape(r['camera_no'])}</td><td>{r['group_date']}</td>"
+            f"<td>{escape(_quota_text(json.loads(r['quotas'])))}</td>"
+            f"<td>{r['max_groups']}</td><td>{r['group_count']}</td></tr>"
+            for r in lists
+        )
+    else:
+        rows_html = '<tr><td colspan="8">还没有复核清单。</td></tr>'
+    body = f"""
+<div class="card"><h2 style="margin-top:0">复核清单</h2>
+<table><tr><th>清单</th><th>创建时间(UTC)</th><th>固定版本</th><th>相机</th><th>组起始日期</th>
+<th>物种配额</th><th>总组数上限</th><th>实选组数</th></tr>
+{rows_html}</table>
+<p><a class="btn" href="/review/new">新建挑选</a> <a class="btn secondary" href="/">返回首页</a></p></div>"""
+    return page("复核清单", body)
+
+
+def _quota_text(quotas: dict) -> str:
+    return "、".join(f"{s} ≥ {n} 组" for s, n in sorted(quotas.items()))
+
+
+def review_detail_page(settings: Settings, lid: int) -> str:
+    conn = connect(settings)
+    try:
+        lst = conn.execute("SELECT * FROM review_lists WHERE id=?", (lid,)).fetchone()
+        if lst is None:
+            raise HTTPException(404, "清单不存在")
+        group_ids = [
+            r["group_id"]
+            for r in conn.execute(
+                "SELECT group_id FROM review_list_groups WHERE list_id=? ORDER BY group_id", (lid,)
+            )
+        ]
+        photos = conn.execute(
+            "SELECT * FROM review_list_photos WHERE list_id=? ORDER BY group_id, captured_at, photo_no",
+            (lid,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    quotas = json.loads(lst["quotas"])
+    by_group: dict[str, list] = {}
+    for p in photos:
+        by_group.setdefault(p["group_id"], []).append(p)
+
+    grows = []
+    for gid in group_ids:
+        gph = by_group[gid]
+        times = [p["captured_at"] for p in gph]
+        sp = "、".join(sorted({p["species"] for p in gph}))
+        grows.append(
+            f"<tr><td>{escape(gid)}</td><td>{min(times)}</td><td>{max(times)}</td>"
+            f"<td>{len(gph)}</td><td>{escape(sp)}</td></tr>"
+        )
+    prows = "".join(
+        f"<tr><td>{escape(p['group_id'])}</td><td>{escape(p['photo_no'])}</td>"
+        f"<td>{escape(p['camera_no'])}</td><td>{p['captured_at']}</td>"
+        f"<td>{escape(p['species'])}</td><td>{escape(p['rel_path'])}</td></tr>"
+        for p in photos
+    )
+    body = f"""
+<div class="card"><h2 style="margin-top:0">复核清单 #{lid}</h2>
+<table>
+<tr><th>创建时间(UTC)</th><td>{lst['created_at']}</td></tr>
+<tr><th>固定版本</th><td><a href="/versions/{lst['version_id']}">v{lst['version_id']}</a>
+（清单内容取自该版本训练索引，不随后续发布变化）</td></tr>
+<tr><th>相机</th><td>{escape(lst['camera_no'])}</td></tr>
+<tr><th>组起始日期(UTC)</th><td>{lst['group_date']}</td></tr>
+<tr><th>物种配额</th><td>{escape(_quota_text(quotas))}</td></tr>
+<tr><th>总组数上限</th><td>{lst['max_groups']}</td></tr>
+<tr><th>实选</th><td>{lst['group_count']} 组 / {len(photos)} 张照片</td></tr>
+</table>
+<p><a class="btn" href="/review/{lid}/photos.csv">下载清单照片 CSV</a>
+<a class="btn secondary" href="/review">清单列表</a>
+<a class="btn secondary" href="/review/new?version_id={lst['version_id']}">再次挑选</a></p></div>
+<div class="card"><h2 style="margin-top:0">所选出没组（{len(group_ids)}）</h2>
+<table><tr><th>group_id</th><th>开始(UTC)</th><th>结束(UTC)</th><th>张数</th><th>覆盖物种</th></tr>
+{''.join(grows)}</table></div>
+<div class="card"><h2 style="margin-top:0">所选组的全部照片（{len(photos)}）</h2>
+<table><tr><th>group_id</th><th>照片号</th><th>相机</th><th>拍摄时间(UTC)</th><th>物种</th><th>原图相对路径</th></tr>
+{prows}</table></div>"""
+    return page(f"复核清单 #{lid}", body)
+
+
 # ---------------------------------------------------------------- 应用
 
 def create_app(settings: Settings) -> FastAPI:
@@ -697,6 +1026,114 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/batches/{bid}", response_class=HTMLResponse)
     def batch_detail(bid: int) -> str:
         return batch_detail_page(settings, bid)
+
+    # 注意：/review 与 /review/new 必须先于 /review/{lid} 注册
+    @app.get("/review", response_class=HTMLResponse)
+    def review_index() -> str:
+        return review_list_page(settings)
+
+    @app.get("/review/new", response_class=HTMLResponse)
+    def review_new(request: Request) -> str:
+        return review_new_page(settings, request.query_params)
+
+    @app.post("/review")
+    async def review_create(request: Request):
+        form = await request.form()
+
+        def back(message: str, kind: str = "err"):
+            params = {k: str(v) for k, v in form.items()}
+            params.update({"kind": kind, "msg": message})
+            return RedirectResponse("/review/new?" + urlencode(params), 303)
+
+        try:
+            vid = int(str(form.get("version_id", "")).strip())
+        except ValueError:
+            return back("版本参数无效")
+        v, rows = load_train_rows(settings, vid)
+        if v is None:
+            return back("所选版本不存在")
+
+        camera_no = str(form.get("camera_no", "")).strip()
+        if not camera_no:
+            return back("请选择相机")
+        group_date = str(form.get("group_date", "")).strip()
+        try:
+            group_date = datetime.strptime(group_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return back("组起始日期无效（需 YYYY-MM-DD，UTC）")
+        try:
+            max_groups = int(str(form.get("max_groups", "")).strip())
+            if max_groups < 1:
+                raise ValueError
+        except ValueError:
+            return back("总组数上限需为不小于 1 的整数")
+
+        known_species = {r["species"] for r in rows}
+        quotas: dict[str, int] = {}
+        for key, val in form.items():
+            if not key.startswith("quota_"):
+                continue
+            species = key[len("quota_"):]
+            if species not in known_species:
+                continue
+            raw = str(val).strip()
+            if not raw:
+                continue
+            try:
+                n = int(raw)
+            except ValueError:
+                return back(f"物种 {species} 的配额无效：{raw!r}")
+            if n < 0:
+                return back(f"物种 {species} 的配额不能为负")
+            if n > 0:
+                quotas[species] = n
+        if not quotas:
+            return back("请至少为一个物种填写不小于 1 的复核组数")
+
+        candidates, group_rows = build_candidates(rows, camera_no, group_date)
+        try:
+            selected = select_groups(candidates, quotas, max_groups)
+        except TooManyCandidates as e:
+            return back(f"当日候选 {e.count} 组，超过 {e.limit} 组上限，请缩小范围（调整相机或日期）后再试")
+        except Infeasible as e:
+            return back(e.detail + "；未生成清单")
+
+        try:
+            list_id = save_review_list(
+                settings, vid, camera_no, group_date, quotas, max_groups, selected, group_rows
+            )
+        except Exception as exc:  # 事务已回滚，不留半份清单
+            return back(f"清单保存失败，未生成任何清单：{exc}")
+        return RedirectResponse(f"/review/{list_id}", 303)
+
+    @app.get("/review/{lid}", response_class=HTMLResponse)
+    def review_detail(lid: int) -> str:
+        return review_detail_page(settings, lid)
+
+    @app.get("/review/{lid}/photos.csv")
+    def review_photos_csv(lid: int):
+        conn = connect(settings)
+        try:
+            lst = conn.execute("SELECT id FROM review_lists WHERE id=?", (lid,)).fetchone()
+            if lst is None:
+                raise HTTPException(404, "清单不存在")
+            photos = conn.execute(
+                "SELECT group_id, photo_no, camera_no, captured_at, species, rel_path"
+                " FROM review_list_photos WHERE list_id=? ORDER BY group_id, captured_at, photo_no",
+                (lid,),
+            ).fetchall()
+        finally:
+            conn.close()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["group_id", "photo_no", "camera_no", "captured_at", "species", "rel_path"])
+        for p in photos:
+            w.writerow([p["group_id"], p["photo_no"], p["camera_no"], p["captured_at"], p["species"], p["rel_path"]])
+        return Response(
+            buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="review_{lid}_photos.csv"'},
+        )
 
     if settings.samples_dir:
         samples_root = settings.samples_dir
